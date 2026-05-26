@@ -1,0 +1,259 @@
+# ============================================================
+# EfiGuard — Build + Bootable Disk Image
+# ============================================================
+# Triggers:
+#   - push to master      → build only
+#   - push of v* tags     → build + GitHub Release
+#   - pull_request        → build only
+#   - manual dispatch     → build only
+# ============================================================
+
+name: Build EfiGuard
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  EDK2_TOOLCHAIN: GCC5
+  EDK2_ARCH: X64
+  EDK2_BUILD_TYPE: RELEASE
+  # Pinned stable EDK2 tag. Bump here to update.
+  EDK2_TAG: edk2-stable202505
+  # Disk image size in MiB
+  IMG_SIZE_MIB: 64
+
+# ============================================================
+jobs:
+  build:
+    name: "Build EfiGuard + create .img"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ----------------------------------------------------------
+      # 1. Checkout EfiGuard (with Zydis submodule)
+      # ----------------------------------------------------------
+      - name: Checkout EfiGuardPkg
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: EfiGuardPkg
+
+      # ----------------------------------------------------------
+      # 2. System packages
+      # ----------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            uuid-dev \
+            iasl \
+            nasm \
+            python3 \
+            python3-pip \
+            parted \
+            dosfstools \
+            zip
+      # ----------------------------------------------------------
+      # 3. Cache EDK2 source (key = pinned tag, auto-invalidates on bump)
+      # ----------------------------------------------------------
+      - name: Cache EDK2 source
+        uses: actions/cache@v4
+        id: edk2-cache
+        with:
+          path: edk2
+          key: edk2-${{ env.EDK2_TAG }}-${{ runner.os }}-v6
+
+      # ----------------------------------------------------------
+      # 4. Clone EDK2 — WITHOUT --recurse-submodules.
+      #
+      #    EDK2 has 13 submodules but EfiGuard only needs 2:
+      #      - BaseTools brotli  (required to compile BaseTools itself)
+      #      - MdeModulePkg brotli (required for firmware decompression)
+      #
+      #    The rest (OpenSSL, mbedtls, googletest, subhook, oniguruma,
+      #    jansson, softfloat, libfdt, mipisyst) are NOT used by EfiGuard
+      #    and pulling them wastes ~8 min + causes auth failures in CI
+      #    for repos like subhook that don't allow anonymous HTTPS in CI.
+      # ----------------------------------------------------------
+      - name: Clone EDK2 (minimal submodules)
+        if: steps.edk2-cache.outputs.cache-hit != 'true'
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          echo ">>> Cloning EDK2 base (no submodules)..."
+          git clone \
+            --depth 1 \
+            --branch "${{ env.EDK2_TAG }}" \
+            https://github.com/tianocore/edk2.git \
+            edk2
+
+          echo ">>> Initializing only required submodules..."
+          cd edk2
+          git submodule update --init --depth 1 \
+            BaseTools/Source/C/BrotliCompress/brotli \
+            MdeModulePkg/Library/BrotliCustomDecompressLib/brotli \
+            MdePkg/Library/MipiSysTLib/mipisyst \
+            MdePkg/Library/BaseFdtLib/libfdt
+
+          echo ">>> Done. Submodule status:"
+          git submodule status
+      # ----------------------------------------------------------
+      # 5. Build BaseTools (always rebuild to avoid stale binaries
+      #    when the runner image changes between cache hits)
+      # ----------------------------------------------------------
+      - name: Build EDK2 BaseTools
+        run: make -C edk2/BaseTools -j$(nproc)
+
+      # ----------------------------------------------------------
+      # 6. Move EfiGuardPkg into EDK2 workspace
+      #    (EDK2 build system requires packages to live inside WORKSPACE)
+      # ----------------------------------------------------------
+      - name: Move EfiGuardPkg into EDK2 workspace
+        run: mv EfiGuardPkg edk2/EfiGuardPkg
+
+      # ----------------------------------------------------------
+      # 7. Build EfiGuardDxe.efi + Loader.efi
+      # ----------------------------------------------------------
+      - name: Build EfiGuard
+        working-directory: edk2
+        run: |
+          source edksetup.sh
+          build \
+            -a "${{ env.EDK2_ARCH }}" \
+            -t "${{ env.EDK2_TOOLCHAIN }}" \
+            -p EfiGuardPkg/EfiGuardPkg.dsc \
+            -b "${{ env.EDK2_BUILD_TYPE }}" \
+            -n "$(nproc)"
+      # ----------------------------------------------------------
+      # 8. Collect EFI binaries into staging/
+      # ----------------------------------------------------------
+      - name: Collect EFI binaries
+        run: |
+          BUILD_OUT="edk2/Build/EfiGuard/${{ env.EDK2_BUILD_TYPE }}_${{ env.EDK2_TOOLCHAIN }}/${{ env.EDK2_ARCH }}"
+          mkdir -p staging/EFI/Boot
+          # Loader.efi is renamed to bootx64.efi — standard UEFI fallback boot path
+          cp "${BUILD_OUT}/Loader.efi"       staging/EFI/Boot/bootx64.efi
+          # DXE driver sits next to the loader so it can be discovered at runtime
+          cp "${BUILD_OUT}/EfiGuardDxe.efi"  staging/EFI/Boot/EfiGuardDxe.efi
+          echo "=== Staged files ==="
+          ls -lh staging/EFI/Boot/
+      # ----------------------------------------------------------
+      # 9. Create bootable GPT disk image
+      #
+      #    Disk layout (64 MiB):
+      #      0 – 2 MiB    : GPT header + alignment gap
+      #      2 – 62 MiB   : EFI System Partition (FAT32, ~60 MiB)
+      #      62 – 64 MiB  : GPT backup header
+      #
+      #    Ventoy recognises the ESP and boots bootx64.efi from it.
+      #    The image can also be written with `dd` to a USB drive.
+      # ----------------------------------------------------------
+      - name: Create bootable GPT disk image
+        run: |
+          IMG="efiguard.img"
+          SIZE="${{ env.IMG_SIZE_MIB }}"
+          echo ">>> Creating ${SIZE} MiB sparse disk image..."
+          dd if=/dev/zero of="${IMG}" bs=1M count="${SIZE}" status=progress
+          echo ">>> Partitioning: GPT + single EFI System Partition..."
+          parted -s "${IMG}" mklabel gpt
+          parted -s "${IMG}" mkpart "EFI" fat32 2MiB "$((SIZE - 2))MiB"
+          parted -s "${IMG}" set 1 esp on
+          parted -s "${IMG}" print
+          echo ">>> Attaching loop device (with partition scan)..."
+          LOOP=$(sudo losetup --find --show --partscan "${IMG}")
+          echo "Attached as ${LOOP}"
+          echo ">>> Formatting ESP as FAT32..."
+          sudo mkfs.fat -F 32 -n "EFIGUARD" "${LOOP}p1"
+          echo ">>> Copying EFI files into ESP..."
+          sudo mkdir -p /mnt/esp
+          sudo mount "${LOOP}p1" /mnt/esp
+          sudo cp -rv staging/EFI /mnt/esp/
+          sudo sync
+          sudo umount /mnt/esp
+          echo ">>> Detaching loop device..."
+          sudo losetup --detach "${LOOP}"
+          echo "=== Image summary ==="
+          ls -lh "${IMG}"
+          file "${IMG}"
+      # ----------------------------------------------------------
+      # 10. Also zip the raw EFI files for manual ESP installation
+      # ----------------------------------------------------------
+      - name: Zip EFI files
+        run: zip -r efiguard-efi.zip staging/
+
+      # ----------------------------------------------------------
+      # 11. Upload artifacts (available from the Actions run page)
+      # ----------------------------------------------------------
+      - name: Upload disk image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: efiguard-disk-image
+          path: efiguard.img
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload EFI zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: efiguard-efi-zip
+          path: efiguard-efi.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================================
+  # Release job — triggers only on v* tag pushes
+  # ============================================================
+  release:
+    name: "Create GitHub Release"
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download disk image
+        uses: actions/download-artifact@v4
+        with:
+          name: efiguard-disk-image
+
+      - name: Download EFI zip
+        uses: actions/download-artifact@v4
+        with:
+          name: efiguard-efi-zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            efiguard.img
+            efiguard-efi.zip
+          body: |
+            ## EfiGuard — ${{ github.ref_name }}
+            ### Files
+            | File | Description |
+            |------|-------------|
+            | `efiguard.img` | Bootable GPT disk image (64 MiB, FAT32 ESP). Works with Ventoy and `dd`. |
+            | `efiguard-efi.zip` | Raw `.efi` binaries for manual installation on an existing ESP. |
+            ### Using with Ventoy
+            Copy `efiguard.img` to your Ventoy USB drive and select it from the Ventoy boot menu.
+            ### Using with `dd` (bare metal USB write)
+            ```bash
+            sudo dd if=efiguard.img of=/dev/sdX bs=4M status=progress && sync
+            ```
+            ### Manual EFI install (from the ZIP)
+            Mount your ESP and copy:
+            ```
+            EFI/Boot/bootx64.efi     ← Loader (UEFI fallback boot entry)
+            EFI/Boot/EfiGuardDxe.efi ← DXE driver
+            ```
